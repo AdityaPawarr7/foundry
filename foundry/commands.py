@@ -5,6 +5,7 @@ from __future__ import annotations
 import shlex
 import subprocess
 import sys
+import time
 
 from rich.prompt import Confirm, IntPrompt, Prompt
 from rich.table import Table
@@ -107,6 +108,71 @@ def _open_terminal(command: str) -> bool:
     return False
 
 
+def _ensure_running(ctx: Context, inst: dict) -> dict | None:
+    """Power on a stopped VM and wait until it has an IP. Returns the refreshed VM."""
+    running = {"running", "on", "active", "poweron"}
+    power = str(inst.get("power_status") or "").lower()
+    if power in running and inst.get("ip_address"):
+        return inst
+
+    iid = _instance_id(inst)
+    if power not in running:
+        ui.info(ctx.console, f"Starting [bold]{inst.get('name')}[/bold]…")
+        try:
+            ctx.client().power_on(iid)
+        except BlueLobsterError as exc:
+            ui.error(ctx.console, f"Could not start VM: {exc}")
+            return None
+
+    with ctx.console.status("Waiting for the VM to boot…", spinner="dots"):
+        for _ in range(40):  # ~2 minutes
+            try:
+                fresh = ctx.client().get_instance(iid)
+            except BlueLobsterError:
+                fresh = inst
+            if str(fresh.get("power_status") or "").lower() in running and fresh.get("ip_address"):
+                return fresh
+            time.sleep(3)
+    ui.error(ctx.console, "VM did not come up in time. Try again in a moment.")
+    return None
+
+
+def _pick_or_create_vm(ctx: Context) -> dict | None:
+    """Show the fleet and let the user pick an existing VM or create a new one."""
+    instances = ctx.client().list_instances()
+    table = Table(title="Pick a VM to deploy to", title_style=BRAND, header_style="bold")
+    table.add_column("#", justify="right")
+    table.add_column("Name", style="bold")
+    table.add_column("IP")
+    table.add_column("Type")
+    table.add_column("Power")
+    for i, inst in enumerate(instances, start=1):
+        table.add_row(
+            str(i),
+            str(inst.get("name") or "—"),
+            str(inst.get("ip_address") or "—"),
+            str(inst.get("instance_type") or "—"),
+            _power_style_plain(inst),
+        )
+    create_idx = len(instances) + 1
+    table.add_row(str(create_idx), "[green]+ Create a new VM[/green]", "", "", "")
+    ctx.console.print(table)
+
+    pick = IntPrompt.ask("Pick #", default=1)
+    if pick == create_idx:
+        return _launch_instance_interactive(ctx)
+    if pick < 1 or pick > len(instances):
+        ui.error(ctx.console, "Selection out of range.")
+        return None
+    return instances[pick - 1]
+
+
+def _power_style_plain(inst: dict) -> str:
+    s = str(inst.get("power_status") or "?").lower()
+    color = "green" if s in {"running", "on", "active", "poweron"} else "red"
+    return f"[{color}]{inst.get('power_status') or '?'}[/{color}]"
+
+
 # -- commands ------------------------------------------------------------
 @command("help", "List all commands and what they do.", aliases=("h", "?"), category="General")
 def cmd_help(ctx: Context, args: list[str]) -> None:
@@ -202,17 +268,19 @@ def cmd_deploy(ctx: Context, args: list[str]) -> None:
         return
 
     repo = args[0] if args else Prompt.ask("GitHub repo URL")
-    vm_ref = args[1] if len(args) > 1 else Prompt.ask("Target VM (id or name)")
-    inst = _resolve_instance(ctx, vm_ref)
-    ip = inst.get("ip_address")
-    if not ip:
-        ui.error(ctx.console, "That VM has no IP yet. Start it first: start <vm>.")
+
+    # Resolve the target VM: a named arg, or interactively pick / create one.
+    if len(args) > 1:
+        inst = _resolve_instance(ctx, args[1])
+    else:
+        inst = _pick_or_create_vm(ctx)
+    if not inst:
         return
 
-    power = str(inst.get("power_status") or "").lower()
-    if power not in {"running", "on", "active", "poweron"}:
-        if not Confirm.ask(f"VM looks {power or 'not running'} — try anyway?", default=False):
-            return
+    inst = _ensure_running(ctx, inst)
+    if not inst:
+        return
+    ip = inst.get("ip_address")
 
     user = ui.ssh_user_for(inst, ctx.config.ssh_username)
     key = ctx.config.ssh_private_key_path
@@ -221,11 +289,18 @@ def cmd_deploy(ctx: Context, args: list[str]) -> None:
     if not model or model == "auto":
         model = "claude-opus-4-7"
 
-    ui.info(ctx.console, f"Checking SSH to {user}@{ip}…")
-    if not provision.check_ssh(key, user, ip):
+    # Wait for SSH — freshly started/created VMs need a moment for sshd.
+    reachable = False
+    with ctx.console.status(f"Waiting for SSH on {user}@{ip}…", spinner="dots"):
+        for _ in range(20):  # ~1 minute
+            if provision.check_ssh(key, user, ip):
+                reachable = True
+                break
+            time.sleep(3)
+    if not reachable:
         ui.error(
             ctx.console,
-            f"Cannot SSH to {user}@{ip} with key {key}. Is the VM running and the key authorized?",
+            f"Cannot SSH to {user}@{ip} with key {key}. Is the key authorized on the VM?",
         )
         return
 
@@ -275,8 +350,8 @@ def cmd_attach(ctx: Context, args: list[str]) -> None:
         ctx.console.print(f"  [bold]{cmd}[/bold]")
 
 
-@command("create", "Launch a new VM (interactive).", aliases=("new", "launch"), category="VMs")
-def cmd_create(ctx: Context, args: list[str]) -> None:
+def _launch_instance_interactive(ctx: Context) -> dict | None:
+    """Interactive VM launch. Returns a light instance dict, or None on abort."""
     client = ctx.client()
 
     pubkey = ctx.config.ssh_public_key
@@ -375,15 +450,33 @@ def cmd_create(ctx: Context, args: list[str]) -> None:
 
             client.poll_task(task_id, on_update=_tick)
 
+    ids = resp.get("instance_ids") or []
+    return {
+        "uuid": ids[0] if ids else None,
+        "name": name,
+        "ip_address": assigned_ip,
+        "vm_username": username,
+        "power_status": "running",
+        "metadata": {"foundry_user": username},
+    }
+
+
+@command("create", "Launch a new VM (interactive).", aliases=("new", "launch"), category="VMs")
+def cmd_create(ctx: Context, args: list[str]) -> None:
+    inst = _launch_instance_interactive(ctx)
+    if not inst:
+        return
+    name = inst["name"]
+    assigned_ip = inst.get("ip_address")
+    username = inst.get("vm_username") or ctx.config.ssh_username
     ui.success(ctx.console, f"VM [bold]{name}[/bold] is ready.")
     if assigned_ip:
         ctx.console.print(f"  IP: [bold]{assigned_ip}[/bold]")
-        link = ui.ssh_link({"ip_address": assigned_ip, "vm_username": username}, username)
+        link = ui.ssh_link(inst, username)
         if link:
             ctx.console.print(f"  Connect: {link}")
-    ids = resp.get("instance_ids") or []
-    if ids:
-        ctx.console.print(f"  Instance: [dim]{ids[0]}[/dim]")
+    if inst.get("uuid"):
+        ctx.console.print(f"  Instance: [dim]{inst['uuid']}[/dim]")
     ctx.console.print(
         f"[dim]⌘-click the link, or run[/dim] [bold]connect {name}[/bold] "
         "[dim]for a new terminal. Run[/dim] [bold]vms[/bold] [dim]to see the fleet.[/dim]"
