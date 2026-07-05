@@ -10,7 +10,7 @@ import time
 from rich.prompt import Confirm, IntPrompt, Prompt
 from rich.table import Table
 
-from . import provision, ui
+from . import github, provision, ui
 from .bluelobster import BlueLobsterError
 from .context import Context, ExitREPL
 from .registry import all_commands, command
@@ -173,6 +173,48 @@ def _power_style_plain(inst: dict) -> str:
     return f"[{color}]{inst.get('power_status') or '?'}[/{color}]"
 
 
+def _fork_repo(ctx: Context, url: str) -> str | None:
+    """Fork ``url`` into the fork-token account. Returns the fork's clone URL."""
+    token = ctx.config.fork_token
+    if not token:
+        ui.error(
+            ctx.console,
+            "No fork token. Add [github].fork_token to ~/.foundry/config.toml "
+            "(or set FOUNDRY_FORK_TOKEN).",
+        )
+        return None
+    try:
+        owner, repo = github.parse_repo(url)
+        with github.GitHubClient(token) as gh:
+            me = gh.whoami()
+            ui.info(ctx.console, f"Forking [bold]{owner}/{repo}[/bold] into [bold]{me}[/bold]…")
+            created = gh.fork(owner, repo)
+            fork_owner = (created.get("owner") or {}).get("login") or me
+            fork_name = created.get("name") or repo
+            with ctx.console.status("Waiting for the fork to be ready…", spinner="dots"):
+                ready = gh.wait_for_fork(fork_owner, fork_name)
+        clone_url = ready.get("clone_url") or f"https://github.com/{fork_owner}/{fork_name}.git"
+        ui.success(ctx.console, f"Fork ready: [bold]{fork_owner}/{fork_name}[/bold]")
+        return clone_url
+    except github.GitHubError as exc:
+        ui.error(ctx.console, str(exc))
+        return None
+
+
+@command(
+    "fork",
+    "Fork a GitHub repo into the fork account (Concentrate's token).",
+    usage="fork <repo-url>",
+    category="Agent",
+)
+def cmd_fork(ctx: Context, args: list[str]) -> None:
+    url = args[0] if args else Prompt.ask("Upstream GitHub repo URL")
+    clone_url = _fork_repo(ctx, url)
+    if clone_url:
+        ctx.console.print(f"  Clone URL: [bold]{clone_url}[/bold]")
+        ctx.console.print(f"[dim]Deploy it with[/dim] [bold]deploy {clone_url}[/bold]")
+
+
 # -- commands ------------------------------------------------------------
 @command("help", "List all commands and what they do.", aliases=("h", "?"), category="General")
 def cmd_help(ctx: Context, args: list[str]) -> None:
@@ -268,6 +310,14 @@ def cmd_deploy(ctx: Context, args: list[str]) -> None:
         return
 
     repo = args[0] if args else Prompt.ask("GitHub repo URL")
+
+    # Optionally fork into the fork account first, then clone the fork.
+    if ctx.config.fork_token and Confirm.ask(
+        "Fork this repo into the fork account first?", default=True
+    ):
+        forked = _fork_repo(ctx, repo)
+        if forked:
+            repo = forked
 
     # Resolve the target VM: a named arg, or interactively pick / create one.
     if len(args) > 1:

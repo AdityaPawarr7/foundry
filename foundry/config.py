@@ -30,6 +30,7 @@ class Config:
     concentrate_gh_token: str | None
     # GitHub (later phases)
     github_user: str | None
+    fork_token: str | None
     # SSH
     ssh_public_key_path: Path | None
     ssh_private_key_path: Path | None
@@ -66,6 +67,12 @@ def load_config(path: Path = CONFIG_PATH) -> Config:
         concentrate_model=con.get("default_model", "auto"),
         concentrate_gh_token=os.environ.get("CONCENTRATE_GH_TOKEN") or con.get("github_token"),
         github_user=gh.get("personal_user"),
+        fork_token=(
+            os.environ.get("FOUNDRY_FORK_TOKEN")
+            or gh.get("fork_token")
+            or os.environ.get("CONCENTRATE_GH_TOKEN")
+            or con.get("github_token")
+        ),
         ssh_public_key_path=_expand(ssh.get("public_key_path", "~/.ssh/id_ed25519.pub")),
         ssh_private_key_path=_expand(ssh.get("private_key_path", "~/.ssh/id_ed25519")),
         ssh_username=ssh.get("username", "ubuntu"),
