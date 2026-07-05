@@ -198,6 +198,15 @@ def _fork_repo(ctx: Context, url: str) -> str | None:
         return clone_url
     except github.GitHubError as exc:
         ui.error(ctx.console, str(exc))
+        msg = str(exc).lower()
+        if "403" in msg or "not accessible" in msg:
+            ui.warn(
+                ctx.console,
+                "Forking a third-party repo needs a CLASSIC PAT with the 'repo' scope — "
+                "fine-grained tokens (github_pat_…) can't fork repos they aren't granted on. "
+                "Create a classic token (ghp_…) on the fork account and update "
+                "[github].fork_token in ~/.foundry/config.toml.",
+            )
         return None
 
 
