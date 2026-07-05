@@ -12,6 +12,34 @@ from rich.text import Text
 BRAND = "bold #ff6b4a"  # "lobster" orange
 
 
+# -- ssh helpers ---------------------------------------------------------
+def ssh_user_for(instance: dict, default_user: str = "ubuntu") -> str:
+    """Best-effort login user for a VM (metadata we set, API field, or config default)."""
+    meta = instance.get("metadata") or {}
+    return (
+        instance.get("vm_username")
+        or (meta.get("foundry_user") if isinstance(meta, dict) else None)
+        or default_user
+    )
+
+
+def ssh_command(instance: dict, default_user: str = "ubuntu") -> str | None:
+    """The plain ``ssh user@ip`` command for a VM, or None if it has no IP yet."""
+    ip = instance.get("ip_address")
+    if not ip:
+        return None
+    return f"ssh {ssh_user_for(instance, default_user)}@{ip}"
+
+
+def ssh_link(instance: dict, default_user: str = "ubuntu") -> str | None:
+    """A clickable OSC-8 hyperlink (ssh:// scheme) that opens a session on click."""
+    ip = instance.get("ip_address")
+    if not ip:
+        return None
+    user = ssh_user_for(instance, default_user)
+    return f"[link=ssh://{user}@{ip}][bold cyan]ssh {user}@{ip}[/bold cyan] ↗[/link]"
+
+
 # -- message helpers -----------------------------------------------------
 def info(console: Console, msg: str) -> None:
     console.print(f"[cyan]›[/cyan] {msg}")
@@ -109,7 +137,9 @@ def vm_table(console: Console, instances: list[dict]) -> None:
     console.print(table)
 
 
-def vm_detail(console: Console, instance: dict, stats: dict | None = None) -> None:
+def vm_detail(
+    console: Console, instance: dict, stats: dict | None = None, ssh_default_user: str = "ubuntu"
+) -> None:
     name = instance.get("name") or short_id(instance)
     grid = Table.grid(padding=(0, 2))
     grid.add_column(style="dim", justify="right")
@@ -143,7 +173,18 @@ def vm_detail(console: Console, instance: dict, stats: dict | None = None) -> No
             if key in stats:
                 row(key.replace("_", " ").title(), stats[key])
 
+    link = ssh_link(instance, ssh_default_user)
+    if link:
+        row("Connect", link)
+
     console.print(Panel(grid, title=f"[{BRAND}]{name}[/]", border_style="#ff6b4a"))
+    if link:
+        console.print(
+            "[dim]⌘-click the ssh link to open a session, or run[/dim] "
+            f"[bold]connect {name}[/bold] [dim]for a new terminal window.[/dim]"
+        )
+    elif str(instance.get("power_status") or "").lower() in {"stopped", "off"}:
+        console.print("[dim]VM is stopped — start it to get a connectable IP.[/dim]")
 
 
 def banner(console: Console) -> None:

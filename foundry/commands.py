@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import shlex
+import subprocess
+import sys
+
 from rich.prompt import Confirm, IntPrompt, Prompt
 from rich.table import Table
 
@@ -74,6 +78,35 @@ def _describe_option(entry: dict) -> dict:
     }
 
 
+def _open_terminal(command: str) -> bool:
+    """Open a new terminal window running ``command``. Returns True on success.
+
+    macOS: drives Terminal.app via AppleScript. Linux: tries common emulators.
+    """
+    if sys.platform == "darwin":
+        script = (
+            f'tell application "Terminal"\n'
+            f'    do script "{command}"\n'
+            f'    activate\n'
+            f'end tell'
+        )
+        return subprocess.run(["osascript", "-e", script]).returncode == 0
+    if sys.platform.startswith("linux"):
+        import shutil
+
+        for emu, flag in (
+            ("x-terminal-emulator", "-e"),
+            ("gnome-terminal", "--"),
+            ("konsole", "-e"),
+            ("xterm", "-e"),
+        ):
+            if shutil.which(emu):
+                args = [emu, flag, "bash", "-lc", f"{command}; exec bash"]
+                return subprocess.Popen(args).pid > 0
+        return False
+    return False
+
+
 # -- commands ------------------------------------------------------------
 @command("help", "List all commands and what they do.", aliases=("h", "?"), category="General")
 def cmd_help(ctx: Context, args: list[str]) -> None:
@@ -116,7 +149,39 @@ def cmd_vm(ctx: Context, args: list[str]) -> None:
             stats = ctx.client().instance_stats(iid)
         except BlueLobsterError:
             pass
-    ui.vm_detail(ctx.console, detail, stats)
+    ui.vm_detail(ctx.console, detail, stats, ssh_default_user=ctx.config.ssh_username)
+
+
+@command(
+    "connect",
+    "Open a new terminal window SSH'd into a VM.",
+    usage="connect <id|name>",
+    aliases=("ssh",),
+    category="VMs",
+)
+def cmd_connect(ctx: Context, args: list[str]) -> None:
+    if not args:
+        ui.error(ctx.console, "Usage: connect <id|name>")
+        return
+    inst = _resolve_instance(ctx, args[0])
+    ip = inst.get("ip_address")
+    if not ip:
+        ui.error(ctx.console, "That VM has no IP address yet (is it started?).")
+        return
+
+    user = ui.ssh_user_for(inst, ctx.config.ssh_username)
+    parts = ["ssh"]
+    key = ctx.config.ssh_private_key_path
+    if key and key.exists():
+        parts += ["-i", str(key)]
+    parts.append(f"{user}@{ip}")
+    ssh_cmd = " ".join(shlex.quote(p) if " " in p else p for p in parts)
+
+    if _open_terminal(ssh_cmd):
+        ui.success(ctx.console, f"Opening a new terminal → [bold]{ssh_cmd}[/bold]")
+    else:
+        ui.warn(ctx.console, "Couldn't auto-open a terminal here. Run this yourself:")
+        ctx.console.print(f"  [bold]{ssh_cmd}[/bold]")
 
 
 @command("create", "Launch a new VM (interactive).", aliases=("new", "launch"), category="VMs")
@@ -203,7 +268,7 @@ def cmd_create(ctx: Context, args: list[str]) -> None:
         "username": username,
         "ssh_key": pubkey,
         "name": name,
-        "metadata": {"created_by": "foundry"},
+        "metadata": {"created_by": "foundry", "foundry_user": username},
     }
 
     ui.info(ctx.console, f"Launching [bold]{name}[/bold] ({instance_type}) in {region}…")
@@ -222,10 +287,16 @@ def cmd_create(ctx: Context, args: list[str]) -> None:
     ui.success(ctx.console, f"VM [bold]{name}[/bold] is ready.")
     if assigned_ip:
         ctx.console.print(f"  IP: [bold]{assigned_ip}[/bold]")
+        link = ui.ssh_link({"ip_address": assigned_ip, "vm_username": username}, username)
+        if link:
+            ctx.console.print(f"  Connect: {link}")
     ids = resp.get("instance_ids") or []
     if ids:
         ctx.console.print(f"  Instance: [dim]{ids[0]}[/dim]")
-    ctx.console.print("[dim]Run[/dim] [bold]vms[/bold] [dim]to see it in the fleet.[/dim]")
+    ctx.console.print(
+        f"[dim]⌘-click the link, or run[/dim] [bold]connect {name}[/bold] "
+        "[dim]for a new terminal. Run[/dim] [bold]vms[/bold] [dim]to see the fleet.[/dim]"
+    )
 
 
 @command("delete", "Delete a VM.", usage="delete <id|name>", aliases=("rm", "destroy"), category="VMs")
