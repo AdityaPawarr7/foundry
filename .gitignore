@@ -1,0 +1,23 @@
+# Secrets & local config (never commit)
+.foundry/
+*.pem
+*_rsa
+*_ed25519
+config.toml
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# OS
+.DS_Store
