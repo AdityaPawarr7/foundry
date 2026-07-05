@@ -49,6 +49,31 @@ def _instance_id(inst: dict) -> str:
     return str(inst.get("uuid") or inst.get("id"))
 
 
+def _describe_option(entry: dict) -> dict:
+    """Flatten an /instances/available entry into a display-friendly dict.
+
+    Shape: {id, instance_type: {name, description, price_cents_per_hour,
+    specs: {vcpus, memory_gib, storage_gib, gpus, gpu_model?}},
+    regions_with_capacity_available: [{name, description, location}]}.
+    """
+    it = entry.get("instance_type") or {}
+    specs = it.get("specs") or {}
+    gpus = specs.get("gpus") or 0
+    model = specs.get("gpu_model")
+    if isinstance(model, list):
+        model = model[0] if model else None
+    return {
+        "id": entry.get("id") or it.get("name"),
+        "desc": it.get("description") or "",
+        "price": it.get("price_cents_per_hour"),
+        "vcpus": specs.get("vcpus"),
+        "mem": specs.get("memory_gib"),
+        "storage": specs.get("storage_gib"),
+        "gpu": (f"{gpus}× {model}" if model else str(gpus)) if gpus else "—",
+        "regions": entry.get("regions_with_capacity_available") or [],
+    }
+
+
 # -- commands ------------------------------------------------------------
 @command("help", "List all commands and what they do.", aliases=("h", "?"), category="General")
 def cmd_help(ctx: Context, args: list[str]) -> None:
@@ -114,30 +139,61 @@ def cmd_create(ctx: Context, args: list[str]) -> None:
         return
 
     # Present a numbered menu of what's on offer.
+    described = [_describe_option(o) for o in options]
     table = Table(title="Available instance types", title_style=BRAND, header_style="bold")
     table.add_column("#", justify="right")
     table.add_column("Type", style="bold")
-    table.add_column("Region")
-    table.add_column("Details", style="dim")
-    for idx, opt in enumerate(options, start=1):
-        itype = opt.get("instance_type") or opt.get("name") or opt.get("type") or "?"
-        region = opt.get("region") or "—"
-        details = ", ".join(
-            f"{k}={v}"
-            for k, v in opt.items()
-            if k not in {"instance_type", "name", "type", "region"} and v not in (None, "")
+    table.add_column("vCPU", justify="right")
+    table.add_column("RAM", justify="right")
+    table.add_column("Disk", justify="right")
+    table.add_column("GPU")
+    table.add_column("$/hr", justify="right")
+    table.add_column("Regions", style="dim")
+    for idx, d in enumerate(described, start=1):
+        price = f"${d['price'] / 100:.2f}" if d["price"] is not None else "—"
+        regions = ", ".join(r.get("name", "?") for r in d["regions"]) or "—"
+        table.add_row(
+            str(idx),
+            str(d["id"]),
+            str(d["vcpus"] or "—"),
+            f"{d['mem']} GB" if d["mem"] else "—",
+            f"{d['storage']} GB" if d["storage"] else "—",
+            d["gpu"],
+            price,
+            regions,
         )
-        table.add_row(str(idx), str(itype), str(region), details[:60])
     ctx.console.print(table)
 
     choice = IntPrompt.ask("Pick an instance type #", default=1)
-    if choice < 1 or choice > len(options):
+    if choice < 1 or choice > len(described):
         ui.error(ctx.console, "Selection out of range.")
         return
-    chosen = options[choice - 1]
+    chosen = described[choice - 1]
+    instance_type = chosen["id"]
 
-    instance_type = chosen.get("instance_type") or chosen.get("name") or chosen.get("type")
-    region = chosen.get("region") or Prompt.ask("Region")
+    # Region: choose from the ones with capacity; send the region's `name`.
+    regions = chosen["regions"]
+    if not regions:
+        region = Prompt.ask("Region")
+    elif len(regions) == 1:
+        region = regions[0].get("name")
+        ui.info(ctx.console, f"Region: [bold]{region}[/bold] ({regions[0].get('description', '')})")
+    else:
+        rtable = Table(title="Regions with capacity", title_style=BRAND, header_style="bold")
+        rtable.add_column("#", justify="right")
+        rtable.add_column("Region", style="bold")
+        rtable.add_column("Location", style="dim")
+        for i, r in enumerate(regions, start=1):
+            loc = r.get("location") or {}
+            where = ", ".join(str(v) for v in (loc.get("city"), loc.get("state"), loc.get("country")) if v)
+            rtable.add_row(str(i), str(r.get("name")), r.get("description") or where)
+        ctx.console.print(rtable)
+        ridx = IntPrompt.ask("Pick a region #", default=1)
+        if ridx < 1 or ridx > len(regions):
+            ui.error(ctx.console, "Selection out of range.")
+            return
+        region = regions[ridx - 1].get("name")
+
     name = Prompt.ask("VM name", default="foundry-vm")
     username = Prompt.ask("Login username", default=ctx.config.ssh_username)
 
