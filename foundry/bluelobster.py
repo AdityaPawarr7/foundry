@@ -133,6 +133,26 @@ class BlueLobsterClient:
     def get_task(self, task_id: str) -> dict:
         return self._get(f"/api/v1/tasks/{task_id}")
 
+    def get_firewall(self, instance_id: str) -> Any:
+        return self._get(f"/api/v1/instances/{instance_id}/firewall")
+
+    def add_firewall_rule(self, instance_id: str, rule: dict) -> Any:
+        return self._post(f"/api/v1/instances/{instance_id}/firewall/rules", json=rule)
+
+    def open_port(self, instance_id: str, port: int, proto: str = "tcp") -> Any:
+        """Convenience: allow inbound TCP on ``port`` for a hosted app."""
+        return self.add_firewall_rule(
+            instance_id,
+            {
+                "type": "in",
+                "action": "ACCEPT",
+                "proto": proto,
+                "dport": str(port),
+                "comment": f"foundry: app port {port}",
+                "enable": 1,
+            },
+        )
+
     # -- helpers ---------------------------------------------------------
     def poll_task(
         self,

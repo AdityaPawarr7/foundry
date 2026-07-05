@@ -9,7 +9,7 @@ import sys
 from rich.prompt import Confirm, IntPrompt, Prompt
 from rich.table import Table
 
-from . import ui
+from . import provision, ui
 from .bluelobster import BlueLobsterError
 from .context import Context, ExitREPL
 from .registry import all_commands, command
@@ -182,6 +182,97 @@ def cmd_connect(ctx: Context, args: list[str]) -> None:
     else:
         ui.warn(ctx.console, "Couldn't auto-open a terminal here. Run this yourself:")
         ctx.console.print(f"  [bold]{ssh_cmd}[/bold]")
+
+
+@command(
+    "deploy",
+    "Clone a repo onto a VM and launch a Claude Code agent (Concentrate) to host it.",
+    usage="deploy <repo-url> [vm]",
+    aliases=("agent",),
+    category="Agent",
+)
+def cmd_deploy(ctx: Context, args: list[str]) -> None:
+    conc = ctx.config.concentrate_api_key
+    if not conc:
+        ui.error(
+            ctx.console,
+            "No Concentrate API key. Set CONCENTRATE_API_KEY or [concentrate].api_key "
+            "in ~/.foundry/config.toml.",
+        )
+        return
+
+    repo = args[0] if args else Prompt.ask("GitHub repo URL")
+    vm_ref = args[1] if len(args) > 1 else Prompt.ask("Target VM (id or name)")
+    inst = _resolve_instance(ctx, vm_ref)
+    ip = inst.get("ip_address")
+    if not ip:
+        ui.error(ctx.console, "That VM has no IP yet. Start it first: start <vm>.")
+        return
+
+    power = str(inst.get("power_status") or "").lower()
+    if power not in {"running", "on", "active", "poweron"}:
+        if not Confirm.ask(f"VM looks {power or 'not running'} — try anyway?", default=False):
+            return
+
+    user = ui.ssh_user_for(inst, ctx.config.ssh_username)
+    key = ctx.config.ssh_private_key_path
+    port = IntPrompt.ask("Port to host the app on", default=8080)
+    model = ctx.config.concentrate_model
+    if not model or model == "auto":
+        model = "claude-opus-4-7"
+
+    ui.info(ctx.console, f"Checking SSH to {user}@{ip}…")
+    if not provision.check_ssh(key, user, ip):
+        ui.error(
+            ctx.console,
+            f"Cannot SSH to {user}@{ip} with key {key}. Is the VM running and the key authorized?",
+        )
+        return
+
+    ui.info(
+        ctx.console,
+        f"Provisioning [bold]{inst.get('name')}[/bold] — Claude Code + clone {repo} + start agent…",
+    )
+    rc = provision.deploy_agent(ctx.console, ip, user, key, repo, conc, model, port)
+    if rc != 0:
+        ui.error(ctx.console, f"Provisioning exited with code {rc}. See output above.")
+        return
+    ui.success(ctx.console, "Agent is running.")
+
+    try:
+        ctx.client().open_port(_instance_id(inst), port)
+        ui.success(ctx.console, f"Opened firewall port {port}.")
+    except BlueLobsterError as exc:
+        ui.warn(ctx.console, f"Could not open port {port} automatically: {exc}")
+
+    name = inst.get("name") or ui.short_id(inst)
+    ctx.console.print()
+    ctx.console.print(f"  View the app:  [bold]http://{ip}:{port}[/bold] [dim](once the agent starts it)[/dim]")
+    ctx.console.print(f"  Direct the agent:  [bold]attach {name}[/bold]")
+
+
+@command(
+    "attach",
+    "Attach to the Claude Code agent running on a VM.",
+    usage="attach <id|name>",
+    category="Agent",
+)
+def cmd_attach(ctx: Context, args: list[str]) -> None:
+    if not args:
+        ui.error(ctx.console, "Usage: attach <id|name>")
+        return
+    inst = _resolve_instance(ctx, args[0])
+    ip = inst.get("ip_address")
+    if not ip:
+        ui.error(ctx.console, "That VM has no IP yet.")
+        return
+    user = ui.ssh_user_for(inst, ctx.config.ssh_username)
+    cmd = provision.attach_command(ctx.config.ssh_private_key_path, user, ip)
+    if _open_terminal(cmd):
+        ui.success(ctx.console, "Opening the agent session in a new terminal…")
+    else:
+        ui.warn(ctx.console, "Run this to attach to the agent:")
+        ctx.console.print(f"  [bold]{cmd}[/bold]")
 
 
 @command("create", "Launch a new VM (interactive).", aliases=("new", "launch"), category="VMs")

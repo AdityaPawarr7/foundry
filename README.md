@@ -39,9 +39,9 @@ far more of it happens.
 
 | Phase | Scope | Status |
 | --- | --- | --- |
-| 1–2 | VM visibility & lifecycle (`vms`, `vm`, `create`, `delete`, power) | ✅ Done |
-| 3 | Fork upstream → clone onto VM → host it, open firewall port | 🔜 Planned |
-| 4 | Concentrate AI generates code on the VM; full fork→PR→upstream pipeline | 🔜 Planned |
+| 1–2 | VM visibility & lifecycle (`vms`, `vm`, `create`, `delete`, power, `connect`) | ✅ Done |
+| 3 | `deploy`: clone a repo onto a VM, launch a Claude Code agent (Concentrate) that hosts it, open the firewall port; `attach` to direct it | ✅ Done |
+| 4 | Fork upstream into your account → the agent opens the PR back upstream (full fork→PR pipeline) | 🔜 Planned |
 | — | Read a Google Doc spec and render it in the CLI (task intake) | 💡 Future |
 
 ## Install
