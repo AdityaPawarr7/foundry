@@ -15,17 +15,22 @@ from rich.console import Console
 # The tmux session the agent runs in (attach with `foundry attach <vm>`).
 AGENT_SESSION = "agent"
 APP_DIR = "$HOME/foundry-app/repo"
+PLAYBOOK_PATH = "$HOME/foundry-app/CONCENTRATE_PLAYBOOK.md"
 
 # Initial instruction handed to Claude Code. Single line, NO apostrophes
 # (it is delivered via `tmux send-keys '<prompt>'`).
 _AGENT_PROMPT = (
-    "This directory is a cloned git repository. Figure out what the project is, "
-    "install its dependencies, then build and run it so it listens on 0.0.0.0 port {port} "
-    "and is reachable from outside the machine (bind to 0.0.0.0, not localhost). "
-    "Prefer the projects own dev/start script or docker compose if present. "
-    "When it is serving, print a short summary of what you did and the exact URL to view it, "
-    "then stop and wait for my next instruction."
+    "Read the playbook at ../CONCENTRATE_PLAYBOOK.md and follow it exactly to make this "
+    "open-source project Concentrate-compatible. Start at Phase 0 (recon, read-only). "
+    "Honor the phase gates: do NOT touch Concentrate until the software runs (Phase 1), "
+    "and STOP at each phase exit for the human to confirm before continuing. Begin now by "
+    "reading the playbook and doing Phase 0, then report your Phase 0 findings and wait."
 )
+
+
+def _load_playbook() -> str:
+    """The Concentrate-compatibility playbook shipped with Foundry."""
+    return (Path(__file__).parent / "playbook.md").read_text()
 
 # Bootstrap script. Placeholders (__CONC_KEY__ etc.) are substituted in Python.
 # Safe to pipe to `bash -s` over SSH *or* paste directly into a VM shell.
@@ -57,6 +62,11 @@ else
   git clone "__REPO__" "$HOME/foundry-app/repo"
 fi
 
+log "writing the Concentrate-compatibility playbook..."
+cat > "$HOME/foundry-app/CONCENTRATE_PLAYBOOK.md" <<'FOUNDRY_PLAYBOOK_EOF'
+__PLAYBOOK__
+FOUNDRY_PLAYBOOK_EOF
+
 log "launching Claude Code agent in tmux session '__SESSION__'..."
 tmux kill-session -t __SESSION__ 2>/dev/null || true
 tmux new-session -d -s __SESSION__ -c "$HOME/foundry-app/repo"
@@ -76,6 +86,7 @@ def build_bootstrap_script(repo_url: str, concentrate_key: str, model: str, port
         .replace("__SESSION__", AGENT_SESSION)
         .replace("__MODEL__", model)
         .replace("__PROMPT__", _AGENT_PROMPT.format(port=port))
+        .replace("__PLAYBOOK__", _load_playbook())
     )
 
 
