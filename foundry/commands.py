@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import shlex
 import subprocess
 import sys
@@ -269,26 +270,75 @@ def cmd_vm(ctx: Context, args: list[str]) -> None:
     ui.vm_detail(ctx.console, detail, stats, ssh_default_user=ctx.config.ssh_username)
 
 
+def _candidate_users(ctx: Context, inst: dict) -> list[str]:
+    """Ordered, de-duplicated list of usernames to try for a VM."""
+    meta = inst.get("metadata") or {}
+    ordered = [
+        meta.get("foundry_user") if isinstance(meta, dict) else None,
+        ctx.config.ssh_username,
+        inst.get("vm_username"),
+        "ubuntu",
+        "admin",
+        "root",
+        "debian",
+    ]
+    out: list[str] = []
+    for u in ordered:
+        if u and u not in out:
+            out.append(u)
+    return out
+
+
 @command(
     "connect",
-    "Open a new terminal window SSH'd into a VM.",
-    usage="connect <id|name>",
+    "Open a terminal SSH'd into a VM (auto-detects the login user).",
+    usage="connect <id|name>  |  connect <user>@<id|name>",
     aliases=("ssh",),
     category="VMs",
 )
 def cmd_connect(ctx: Context, args: list[str]) -> None:
     if not args:
-        ui.error(ctx.console, "Usage: connect <id|name>")
+        ui.error(ctx.console, "Usage: connect <id|name>   (or connect user@<id|name>)")
         return
-    inst = _resolve_instance(ctx, args[0])
+
+    # Accept `user@vm`, `vm user`, or just `vm`.
+    ref = args[0]
+    explicit_user = None
+    if "@" in ref:
+        explicit_user, ref = ref.split("@", 1)
+    elif len(args) > 1:
+        explicit_user = args[1]
+
+    inst = _resolve_instance(ctx, ref)
     ip = inst.get("ip_address")
     if not ip:
         ui.error(ctx.console, "That VM has no IP address yet (is it started?).")
         return
 
-    user = ui.ssh_user_for(inst, ctx.config.ssh_username)
-    parts = ["ssh"]
     key = ctx.config.ssh_private_key_path
+    candidates = [explicit_user] if explicit_user else _candidate_users(ctx, inst)
+
+    # Probe candidates to find the user your key actually authenticates as.
+    user = None
+    if key and key.exists() and not explicit_user:
+        with ctx.console.status(f"Finding a working login on {ip}…", spinner="dots"):
+            user = provision.find_login_user(key, ip, candidates)
+
+    if not user:
+        if not explicit_user:
+            ui.warn(
+                ctx.console,
+                f"Your key didn't authenticate as any of: {', '.join(candidates)}.",
+            )
+            ui.warn(
+                ctx.console,
+                "Likely your id_rsa.pub isn't in the VM's authorized_keys. Add it via the "
+                "Blue Lobster console, or specify the right user: connect <user>@<vm>.",
+            )
+        user = explicit_user or candidates[0]
+        ui.info(ctx.console, f"Opening a terminal as [bold]{user}[/bold] anyway…")
+
+    parts = ["ssh"]
     if key and key.exists():
         parts += ["-i", str(key)]
     parts.append(f"{user}@{ip}")
@@ -299,90 +349,6 @@ def cmd_connect(ctx: Context, args: list[str]) -> None:
     else:
         ui.warn(ctx.console, "Couldn't auto-open a terminal here. Run this yourself:")
         ctx.console.print(f"  [bold]{ssh_cmd}[/bold]")
-
-
-@command(
-    "deploy",
-    "Clone a repo onto a VM and launch a Claude Code agent (Concentrate) to host it.",
-    usage="deploy <repo-url> [vm]",
-    aliases=("agent",),
-    category="Agent",
-)
-def cmd_deploy(ctx: Context, args: list[str]) -> None:
-    conc = ctx.config.concentrate_api_key
-    if not conc:
-        ui.error(
-            ctx.console,
-            "No Concentrate API key. Set CONCENTRATE_API_KEY or [concentrate].api_key "
-            "in ~/.foundry/config.toml.",
-        )
-        return
-
-    repo = args[0] if args else Prompt.ask("GitHub repo URL")
-
-    # Optionally fork into the fork account first, then clone the fork.
-    if ctx.config.fork_token and Confirm.ask(
-        "Fork this repo into the fork account first?", default=True
-    ):
-        forked = _fork_repo(ctx, repo)
-        if forked:
-            repo = forked
-
-    # Resolve the target VM: a named arg, or interactively pick / create one.
-    if len(args) > 1:
-        inst = _resolve_instance(ctx, args[1])
-    else:
-        inst = _pick_or_create_vm(ctx)
-    if not inst:
-        return
-
-    inst = _ensure_running(ctx, inst)
-    if not inst:
-        return
-    ip = inst.get("ip_address")
-
-    user = ui.ssh_user_for(inst, ctx.config.ssh_username)
-    key = ctx.config.ssh_private_key_path
-    port = IntPrompt.ask("Port to host the app on", default=8080)
-    model = ctx.config.concentrate_model
-    if not model or model == "auto":
-        model = "claude-opus-4-7"
-
-    # Wait for SSH — freshly started/created VMs need a moment for sshd.
-    reachable = False
-    with ctx.console.status(f"Waiting for SSH on {user}@{ip}…", spinner="dots"):
-        for _ in range(20):  # ~1 minute
-            if provision.check_ssh(key, user, ip):
-                reachable = True
-                break
-            time.sleep(3)
-    if not reachable:
-        ui.error(
-            ctx.console,
-            f"Cannot SSH to {user}@{ip} with key {key}. Is the key authorized on the VM?",
-        )
-        return
-
-    ui.info(
-        ctx.console,
-        f"Provisioning [bold]{inst.get('name')}[/bold] — Claude Code + clone {repo} + start agent…",
-    )
-    rc = provision.deploy_agent(ctx.console, ip, user, key, repo, conc, model, port)
-    if rc != 0:
-        ui.error(ctx.console, f"Provisioning exited with code {rc}. See output above.")
-        return
-    ui.success(ctx.console, "Agent is running.")
-
-    try:
-        ctx.client().open_port(_instance_id(inst), port)
-        ui.success(ctx.console, f"Opened firewall port {port}.")
-    except BlueLobsterError as exc:
-        ui.warn(ctx.console, f"Could not open port {port} automatically: {exc}")
-
-    name = inst.get("name") or ui.short_id(inst)
-    ctx.console.print()
-    ctx.console.print(f"  View the app:  [bold]http://{ip}:{port}[/bold] [dim](once the agent starts it)[/dim]")
-    ctx.console.print(f"  Direct the agent:  [bold]attach {name}[/bold]")
 
 
 @command(
@@ -407,6 +373,38 @@ def cmd_attach(ctx: Context, args: list[str]) -> None:
     else:
         ui.warn(ctx.console, "Run this to attach to the agent:")
         ctx.console.print(f"  [bold]{cmd}[/bold]")
+
+
+@command(
+    "bootstrap",
+    "Print a paste-ready setup script to run inside a VM's SSH session.",
+    usage="bootstrap <repo-url>",
+    category="Agent",
+)
+def cmd_bootstrap(ctx: Context, args: list[str]) -> None:
+    conc = ctx.config.concentrate_api_key
+    if not conc:
+        ui.error(
+            ctx.console,
+            "No Concentrate API key. Set [concentrate].api_key in ~/.foundry/config.toml.",
+        )
+        return
+    repo = args[0] if args else Prompt.ask("GitHub repo URL to clone on the VM")
+    model = ctx.config.concentrate_model
+    if not model or model == "auto":
+        model = "claude-opus-4-7"
+    port = IntPrompt.ask("Port to host on", default=8080)
+    script = provision.build_bootstrap_script(repo, conc, model, port)
+
+    ui.info(ctx.console, "SSH into your VM, then paste everything between the lines below:")
+    ctx.console.print("[dim]" + "─" * 72 + "[/dim]")
+    ctx.console.print(script, markup=False, highlight=False, soft_wrap=True)
+    ctx.console.print("[dim]" + "─" * 72 + "[/dim]")
+    ctx.console.print(
+        f"[dim]Then watch the agent with[/dim] [bold]tmux attach -t {provision.AGENT_SESSION}[/bold]"
+        f"[dim]. View the app at[/dim] [bold]http://<vm-ip>:{port}[/bold] "
+        "[dim](open that port in the Blue Lobster firewall / via deploy).[/dim]"
+    )
 
 
 def _launch_instance_interactive(ctx: Context) -> dict | None:
@@ -484,8 +482,25 @@ def _launch_instance_interactive(ctx: Context) -> dict | None:
             return
         region = regions[ridx - 1].get("name")
 
-    name = Prompt.ask("VM name", default="foundry-vm")
-    username = Prompt.ask("Login username", default=ctx.config.ssh_username)
+    existing = {str(i.get("name") or "").lower() for i in client.list_instances()}
+    while True:
+        name = Prompt.ask("VM name", default="foundry-vm")
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,62}", name):
+            ui.warn(ctx.console, "Name must start alphanumeric; letters, digits, . - _ only.")
+            continue
+        if name.lower() in existing:
+            ui.warn(ctx.console, f"A VM named {name!r} already exists — pick another name.")
+            continue
+        break
+    while True:
+        username = Prompt.ask("Login username", default=ctx.config.ssh_username)
+        if re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", username):
+            break
+        ui.warn(
+            ctx.console,
+            "Invalid Linux username: must start with a lowercase letter or _, "
+            "then lowercase letters/digits/-/_ (and it can't be all numbers).",
+        )
 
     body = {
         "region": region,
